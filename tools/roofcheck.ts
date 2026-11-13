@@ -12,7 +12,8 @@ import {LightList} from '../src/city/gen-base.ts';
 import {generateLayout} from '../src/city/layout.ts';
 import {pointInPolygon, pointSegment, type Vec2} from '../src/math/vec.ts';
 
-const EAVE = 0.6;
+// Overhang allowed past the walls (m); EAVE=1 node tools/roofcheck.ts ...
+const EAVE = Number(process.env.EAVE ?? 0.6);
 const cities = (process.argv[2] ?? 'neon,metro,harbour,river').split(
   ',',
 ) as CityType[];
