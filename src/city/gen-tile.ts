@@ -12,7 +12,7 @@ import {
   type Vec3,
 } from '../math/vec.ts';
 import {CM, CMesh, packMat, triangulate} from './cmesh.ts';
-import {keepLeft, nearside} from './config.ts';
+import {keepLeft, nearside, type CityType} from './config.ts';
 import {
   CITI_BLUE,
   LightKind,
@@ -196,7 +196,14 @@ function cap(m: CMesh, poly: Vec2[], y: number, mat: number, aux = 0) {
     m.triFacing(ids[idx[i]], ids[idx[i + 1]], ids[idx[i + 2]], UP);
 }
 
-function parapet(m: CMesh, poly: Vec2[], y: number, h: number, mat: number) {
+function parapet(
+  m: CMesh,
+  poly: Vec2[],
+  y: number,
+  h: number,
+  mat: number,
+  aux = 0,
+) {
   for (let i = 0; i < poly.length; i++) {
     const a = poly[i];
     const b = poly[(i + 1) % poly.length];
@@ -206,7 +213,7 @@ function parapet(m: CMesh, poly: Vec2[], y: number, h: number, mat: number) {
       0.18,
       h / 2,
       mat,
-      0,
+      aux,
       undefined,
       CHAMFER,
     );
@@ -2890,6 +2897,304 @@ function midriseMassing(b: Building, rng: Rng, fr: Rng) {
 const podiumFloors = (rng: Rng) => rng.int(2, 5);
 const PODIUM_H = 4.6;
 
+/** A roof plane: height a x + b z + k over plan point (x, z). */
+type RoofPlane = [number, number, number];
+const planeAt = (P: RoofPlane, q: Vec2) => P[0] * q[0] + P[1] * q[1] + P[2];
+
+/** The part of convex `poly` where a x + b z + k <= 0. */
+function clipHalf(poly: Vec2[], a: number, b: number, k: number): Vec2[] {
+  const eps = 1e-6;
+  const out: Vec2[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i];
+    const q = poly[(i + 1) % poly.length];
+    const dp = a * p[0] + b * p[1] + k;
+    const dq = a * q[0] + b * q[1] + k;
+    if (dp <= eps) out.push(p);
+    if ((dp < -eps && dq > eps) || (dp > eps && dq < -eps)) {
+      const t = dp / (dp - dq);
+      out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+    }
+  }
+  // Drop repeated points and the corners left on a straight run (clip lines
+  // through a vertex).
+  const u = out.filter(
+    (q, i) => dist2(q, out[(i + 1) % out.length]) > 1e-4 || out.length < 2,
+  );
+  return u.filter((q, i) => {
+    const p = u[(i - 1 + u.length) % u.length];
+    const r = u[(i + 1) % u.length];
+    const cr = (q[0] - p[0]) * (r[1] - q[1]) - (q[1] - p[1]) * (r[0] - q[0]);
+    return Math.abs(cr) > 1e-4 * dist2(p, q) * dist2(q, r);
+  });
+}
+
+function isConvex(poly: Vec2[]) {
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const c = poly[(i + 2) % poly.length];
+    const cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    if (cr < -1e-6) return false;
+  }
+  return true;
+}
+
+/**
+ * CCW `poly` grown out by `d`, each corner moved no more than `max` (a sharp
+ * corner's mitre would reach far past it); null if that leaves it crossing
+ * itself.
+ */
+function eavePlan(poly: Vec2[], d: number, max: number): Vec2[] | null {
+  const n = poly.length;
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) {
+    const q = poly[i];
+    const e0 = edgeNormal(poly, (i - 1 + n) % n);
+    const e1 = edgeNormal(poly, i);
+    // Mitre: the bisector, scaled so both edges move out by d.
+    let mx = e0[0] + e1[0],
+      mz = e0[2] + e1[2];
+    const ml = Math.hypot(mx, mz);
+    if (ml < 1e-3) return null;
+    mx /= ml;
+    mz /= ml;
+    const cos = mx * e1[0] + mz * e1[2];
+    const s = Math.min(d / Math.max(cos, 1e-3), max);
+    out.push([q[0] + mx * s, q[1] + mz * s]);
+  }
+  return simplePolygon(out) === out && polygonArea(out) > polygonArea(poly)
+    ? out
+    : null;
+}
+
+/**
+ * A pitched roof over CCW footprint `fp` with its eaves at `eaves`: the
+ * lower envelope of `planes` (each at least `eaves` over the footprint), out
+ * to a 0.45 m overhang where it drops on down, and gable walls filling up
+ * from the eaves to the roof on any wall the roof stands above.
+ */
+function pitchedRoof(
+  m: CMesh,
+  fp: Vec2[],
+  eaves: number,
+  planes: RoofPlane[],
+  roofMat: number,
+  wallMat: number,
+  aux: number,
+) {
+  const plan = eavePlan(fp, 0.45, 0.58) ?? fp;
+  const pieces = isConvex(plan)
+    ? [plan]
+    : (() => {
+        const idx = triangulate(plan);
+        const t: Vec2[][] = [];
+        for (let i = 0; i < idx.length; i += 3)
+          t.push([plan[idx[i]], plan[idx[i + 1]], plan[idx[i + 2]]]);
+        return t;
+      })();
+  planes.forEach((P, i) => {
+    // Plan-space slope direction for the courses (uv.y up the slope).
+    const g = Math.hypot(P[0], P[1]);
+    const gd: Vec2 = g > 1e-6 ? [P[0] / g, P[1] / g] : [0, 1];
+    const n: Vec3 = [-P[0], 1, -P[1]];
+    const nl = Math.hypot(n[0], n[1], n[2]);
+    n[0] /= nl;
+    n[1] /= nl;
+    n[2] /= nl;
+    for (const piece of pieces) {
+      let f = piece;
+      for (let j = 0; j < planes.length && f.length >= 3; j++) {
+        if (j === i) continue;
+        const Q = planes[j];
+        // Where plane i lies under plane j.
+        f = clipHalf(f, P[0] - Q[0], P[1] - Q[1], P[2] - Q[2]);
+      }
+      if (f.length < 3 || Math.abs(polygonArea(f)) < 0.02) continue;
+      const ids = f.map(q =>
+        m.vertex(
+          [q[0], planeAt(P, q), q[1]],
+          n,
+          q[0] * -gd[1] + q[1] * gd[0],
+          q[0] * gd[0] + q[1] * gd[1],
+          roofMat,
+          aux,
+        ),
+      );
+      for (let k = 1; k + 1 < ids.length; k++)
+        m.triFacing(ids[0], ids[k], ids[k + 1], n);
+    }
+  });
+  // Gable walls: up from the eaves to the roof along each wall.
+  const H = (q: Vec2) => Math.min(...planes.map(P => planeAt(P, q)));
+  let u0 = 0;
+  for (let i = 0; i < fp.length; i++) {
+    const a = fp[i];
+    const c = fp[(i + 1) % fp.length];
+    const len = dist2(a, c);
+    const at = (t: number): Vec2 => [
+      a[0] + (c[0] - a[0]) * t,
+      a[1] + (c[1] - a[1]) * t,
+    ];
+    // Where the roof over the wall changes plane.
+    const ts = [0, 1];
+    for (let p = 0; p < planes.length; p++)
+      for (let q = p + 1; q < planes.length; q++) {
+        const da = planeAt(planes[p], a) - planeAt(planes[q], a);
+        const dc = planeAt(planes[p], c) - planeAt(planes[q], c);
+        if (da > 0 !== dc > 0 && Math.abs(da - dc) > 1e-9) {
+          const t = da / (da - dc);
+          if (t > 1e-4 && t < 1 - 1e-4) ts.push(t);
+        }
+      }
+    ts.sort((x, y) => x - y);
+    const top = ts.map(t => {
+      const q = at(t);
+      return {t, q, y: Math.max(eaves, H(q))};
+    });
+    if (top.every(s => s.y - eaves < 0.03)) {
+      u0 += len;
+      continue;
+    }
+    const n = edgeNormal(fp, i);
+    const ids = [
+      m.vertex([a[0], eaves, a[1]], n, u0, 0, wallMat, aux),
+      m.vertex([c[0], eaves, c[1]], n, u0 + len, 0, wallMat, aux),
+    ];
+    for (let k = top.length - 1; k >= 0; k--) {
+      const s = top[k];
+      if ((k === 0 || k === top.length - 1) && s.y - eaves < 1e-3) continue;
+      ids.push(
+        m.vertex(
+          [s.q[0], s.y, s.q[1]],
+          n,
+          u0 + s.t * len,
+          s.y - eaves,
+          wallMat,
+          aux,
+        ),
+      );
+    }
+    for (let k = 1; k + 1 < ids.length; k++)
+      m.triFacing(ids[0], ids[k], ids[k + 1], n);
+    u0 += len;
+  }
+}
+
+/**
+ * A house's roof over `fp`: a gable along the long axis on a near-rectangle
+ * or an awkward (concave) plan, else a hip from every wall; topped flat
+ * past `maxRise` over the eaves on a big plan.
+ */
+function houseRoof(
+  m: CMesh,
+  b: Building,
+  fp: Vec2[],
+  eaves: number,
+  roofMat: number,
+  wallMat: number,
+  aux: number,
+) {
+  const slope = 0.55;
+  const maxRise = 4;
+  const box = obb(fp);
+  const rect = polygonArea(fp) / (4 * box.hu * box.hv);
+  const convex = isConvex(fp);
+  // Some near-rectangular houses are hipped too (from the style word, not
+  // the building stream).
+  const hipRect = ((b.style >>> 5) & 3) === 0;
+  const planes: RoofPlane[] = [];
+  if (!convex || (fp.length === 4 && rect > 0.9 && !hipRect)) {
+    const u = box.hu >= box.hv ? box.u : ([-box.u[1], box.u[0]] as Vec2);
+    const v: Vec2 = [-u[1], u[0]];
+    const C = box.c;
+    const d0 = C[0] * v[0] + C[1] * v[1];
+    let hv = 0;
+    for (const q of fp)
+      hv = Math.max(hv, Math.abs(q[0] * v[0] + q[1] * v[1] - d0));
+    // eaves + slope (hv - |v.(q - C)|), one plane each side of the ridge.
+    for (const s of [-1, 1])
+      planes.push([
+        -s * slope * v[0],
+        -s * slope * v[1],
+        eaves + slope * hv + s * slope * d0,
+      ]);
+  } else {
+    for (let i = 0; i < fp.length; i++) {
+      const a = fp[i];
+      const n = edgeNormal(fp, i);
+      // eaves + slope * (distance in from wall i).
+      planes.push([
+        -slope * n[0],
+        -slope * n[2],
+        eaves + slope * (a[0] * n[0] + a[1] * n[2]),
+      ]);
+    }
+  }
+  planes.push([0, 0, eaves + maxRise]);
+  pitchedRoof(m, fp, eaves, planes, roofMat, wallMat, aux);
+}
+
+/**
+ * Share of houses with a flat roof, by city: Hong Kong's village houses
+ * and Chongqing's hillside blocks are mostly flat-topped boxes; Tokyo and
+ * New York houses mostly pitched. Set per tile (useCityRoofs).
+ */
+const FLAT_HOUSES: Record<CityType, number> = {
+  harbour: 0.75,
+  river: 0.5,
+  neon: 0.15,
+  metro: 0,
+};
+let flatHouses = FLAT_HOUSES.neon;
+
+/** Pick the houses' roof mix of city `type` (buildTile does). */
+export function useCityRoofs(type: CityType) {
+  flatHouses = FLAT_HOUSES[type];
+}
+
+/** Whether house `b` has a flat roof (from its style word, no draws). */
+const flatHouse = (b: Building) => ((b.style >>> 9) & 15) < flatHouses * 16;
+
+/**
+ * A house's flat roof (the eaves cap): a parapet round it (LOD0) and, on
+ * some where the plan has room, a stair hut.
+ */
+function houseFlatRoof(
+  m: CMesh,
+  b: Building,
+  fp: Vec2[],
+  eaves: number,
+  lod: number,
+  mat: number,
+  aux: number,
+) {
+  if (lod === 0) parapet(m, fp, eaves, 0.9, mat, aux);
+  if (!((b.style >>> 13) & 1)) return;
+  const box = obb(fp);
+  const hu = 1.3,
+    hv = 1.2;
+  const v: Vec2 = [-box.u[1], box.u[0]];
+  const c = box.c;
+  const corners = [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ].map(([su, sv]): Vec2 => [
+    c[0] + box.u[0] * su * (hu + 0.6) + v[0] * sv * (hv + 0.6),
+    c[1] + box.u[1] * su * (hu + 0.6) + v[1] * sv * (hv + 0.6),
+  ]);
+  if (!corners.every(q => pointInPolygon(q, fp))) return;
+  m.box(
+    [c[0], eaves + 1.2, c[1]],
+    [hu, 1.2, hv],
+    mat,
+    Math.atan2(-box.u[1], box.u[0]),
+    aux,
+  );
+}
+
 const solidTops = new WeakMap<Building, number>();
 
 /**
@@ -2935,7 +3240,6 @@ export function building(
   let roofY = top;
 
   if (b.kind === 'house') {
-    const box = obb(fp);
     const eaves = top - 1.6;
     walls(
       m,
@@ -2947,64 +3251,17 @@ export function building(
       aux,
     );
     cap(m, fp, eaves, packMat(CM.roof, b.style & 0xffff), aux);
-    // Gable roof over the OBB along its long axis.
-    const u = box.hu >= box.hv ? box.u : ([-box.u[1], box.u[0]] as Vec2);
-    const hu = Math.max(box.hu, box.hv) + 0.4;
-    const hv = Math.min(box.hu, box.hv) + 0.5;
-    const v: Vec2 = [-u[1], u[0]];
-    const C = box.c;
-    const P = (su: number, sv: number, y: number): Vec3 => [
-      C[0] + u[0] * su * hu + v[0] * sv * hv,
-      y,
-      C[1] + u[1] * su * hu + v[1] * sv * hv,
-    ];
-    const ridge = eaves + hv * 0.55;
-    const tileMat = packMat(CM.tile, b.style & 0xffff);
-    for (const s of [-1, 1]) {
-      const n: Vec3 = [v[0] * s * 0.6, 0.8, v[1] * s * 0.6];
-      m.quad(
-        [
-          P(-1, s, eaves - 0.1),
-          P(1, s, eaves - 0.1),
-          P(1, 0, ridge),
-          P(-1, 0, ridge),
-        ],
-        n,
-        [
-          [0, 0],
-          [hu * 2, 0],
-          [hu * 2, hv],
-          [0, hv],
-        ],
-        tileMat,
-      );
-      // Gable end triangle.
-      const e = m.vertex(
-        P(s, -1, eaves - 0.1),
-        [u[0] * s, 0, u[1] * s],
-        0,
-        0,
+    if (flatHouse(b)) houseFlatRoof(m, b, fp, eaves, lod, concrete, aux);
+    else
+      houseRoof(
+        m,
+        b,
+        fp,
+        eaves,
+        packMat(CM.tile, b.style & 0xffff),
         packMat(CM.facade, facadeParam(b, false, false)),
         aux,
       );
-      const f = m.vertex(
-        P(s, 1, eaves - 0.1),
-        [u[0] * s, 0, u[1] * s],
-        hv * 2,
-        0,
-        packMat(CM.facade, facadeParam(b, false, false)),
-        aux,
-      );
-      const g = m.vertex(
-        P(s, 0, ridge),
-        [u[0] * s, 0, u[1] * s],
-        hv,
-        ridge - eaves,
-        packMat(CM.facade, facadeParam(b, false, false)),
-        aux,
-      );
-      m.triFacing(e, f, g, [u[0] * s, 0, u[1] * s]);
-    }
     if (lod === 0 && rng.chance(0.5)) {
       // Small AC unit and a garden wall.
       const i = rng.int(0, fp.length);
@@ -10588,6 +10845,7 @@ export function buildTile(
   }
   const L = ctx.layout;
   S = SIGN_SETS[signLocaleOf(L.params.type)];
+  useCityRoofs(L.params.type);
   const m = new CMesh(1 << 14, 1 << 15);
   const lights = new LightList();
   const hf: Heightfield = L.terrain.heights;
