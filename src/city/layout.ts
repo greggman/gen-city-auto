@@ -392,6 +392,135 @@ export function simplePolygon(poly: Vec2[], depth = 0): Vec2[] {
   return poly;
 }
 
+/** Narrowest a plan may get between two parts before it counts as two (m). */
+const NECK = 1;
+
+/**
+ * Where CCW `poly` is pinched in two: a corner within NECK of a wall across
+ * the plan, both parts at least 4 m² and (unless they touch) each wider on
+ * average than 1.5 m, so a sharp corner's tip is not a part. Returns the two
+ * parts (corner i to wall j, the rest), narrowest neck first; null if none.
+ */
+export function pinchParts(poly: Vec2[]): [Vec2[], Vec2[]] | null {
+  const n = poly.length;
+  const perim = (l: Vec2[]) =>
+    l.reduce((s, q, k) => s + dist2(q, l[(k + 1) % l.length]), 0);
+  let best: [Vec2[], Vec2[]] | null = null;
+  let bestD = NECK;
+  for (let i = 0; i < n; i++)
+    for (let j = 0; j < n; j++) {
+      if (j === i || (j + 1) % n === i) continue;
+      const p = poly[j],
+        q = poly[(j + 1) % n];
+      const [d, t] = pointSegment(poly[i], p, q);
+      if (d >= bestD) continue;
+      // The parts either side of the cut from corner i to its foot x on
+      // wall j; they keep m, halfway along it, for both.
+      const x: Vec2 = [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
+      const m: Vec2 = [(poly[i][0] + x[0]) / 2, (poly[i][1] + x[1]) / 2];
+      const a: Vec2[] = [];
+      for (let k = (i + 1) % n; k !== (j + 1) % n; k = (k + 1) % n)
+        a.push(poly[k]);
+      const b: Vec2[] = [];
+      for (let k = (j + 1) % n; k !== i; k = (k + 1) % n) b.push(poly[k]);
+      if (a.length < 2 || b.length < 2) continue;
+      const fa = [poly[i], ...a, x],
+        fb = [x, ...b, poly[i]];
+      const aa = polygonArea(fa),
+        ab = polygonArea(fb);
+      if (Math.min(aa, ab) < 4) continue;
+      const w = Math.min((2 * aa) / perim(fa), (2 * ab) / perim(fb));
+      if (d >= 0.25 && w < 1.5) continue;
+      best = [
+        [m, ...a],
+        [m, ...b],
+      ];
+      bestD = d;
+    }
+  return best;
+}
+
+/**
+ * A plan's parts once pinches and crossings are cut apart, cleaned, largest
+ * first; slivers under 4 m² are dropped.
+ */
+export function plainParts(poly: Vec2[], depth = 0): Vec2[][] {
+  if (depth > 8) return [poly];
+  let cut: Vec2[][] | null = pinchParts(poly);
+  if (!cut) {
+    // Walls crossing: keep the main loop.
+    const loop = simplePolygon(poly);
+    if (loop === poly) return [poly];
+    cut = [loop];
+  }
+  const out: Vec2[][] = [];
+  for (const part of cut) {
+    // Clean as lots are, unless that cuts much off (it drops a corner in
+    // line with the cut).
+    let c = cleanPolygon(part, 1.2);
+    if (c.length < 3 || polygonArea(c) < 0.9 * polygonArea(part))
+      c = part.filter((q, k) => dist2(q, part[(k + 1) % part.length]) > 0.05);
+    if (c.length >= 3 && polygonArea(c) >= 4)
+      out.push(...plainParts(c, depth + 1));
+  }
+  return out.sort((a, b) => polygonArea(b) - polygonArea(a));
+}
+
+/**
+ * Lots pinched in two at a corner (two parts touching at a point or joined
+ * by a sliver) slip past simplePolygon when neither part is big enough to
+ * keep on its own, and their walls and roofs then bridge the pinch. Each
+ * keeps its largest part; another part of a lot's size (25 m², 1.5 m wide on
+ * average) becomes a building of its own, appended so every other id stays.
+ * Deterministic and run after all of the layout's draws.
+ */
+function splitPinched(buildings: Building[]) {
+  const n = buildings.length;
+  for (let bi = 0; bi < n; bi++) {
+    const b = buildings[bi];
+    const plan = b.footprint;
+    const parts = plainParts(plan);
+    if (!parts.length || (parts.length === 1 && parts[0] === plan)) continue;
+    const frontage0 = b.frontage;
+    const perim = (l: Vec2[]) =>
+      l.reduce((s, q, k) => s + dist2(q, l[(k + 1) % l.length]), 0);
+    parts.forEach((fp, k) => {
+      const area = polygonArea(fp);
+      if (k > 0 && (area < 25 || (2 * area) / perim(fp) < 1.5)) return;
+      const frontage = inheritFrontage(fp, plan, frontage0);
+      let front = -1;
+      let bestLen = 0;
+      fp.forEach((a, i) => {
+        if (!frontage[i]) return;
+        const l = dist2(a, fp[(i + 1) % fp.length]);
+        if (l > bestLen) {
+          bestLen = l;
+          front = i;
+        }
+      });
+      if (k === 0) {
+        b.footprint = fp;
+        b.frontage = frontage;
+        b.front = front;
+        return;
+      }
+      // A tower's lot is big; a small part of one is a midrise.
+      const small = (b.kind === 'tower' || b.kind === 'glass') && area < 900;
+      buildings.push({
+        ...b,
+        id: buildings.length,
+        kind: small ? 'midrise' : b.kind,
+        footprint: fp,
+        frontage,
+        front,
+        floorH: small ? 3.3 : b.floorH,
+        height: small ? Math.min(b.height, 10 * 3.3) : b.height,
+        seed: hash2(b.seed, k) >>> 0,
+      });
+    });
+  }
+}
+
 /** Whether segment a-b lies on a frontage edge of `poly`. */
 function onFrontage(a: Vec2, b: Vec2, poly: Vec2[], frontage: boolean[]) {
   const mid: Vec2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
@@ -1609,6 +1738,8 @@ export function generateLayout(
   // Every seeded decision is made: give the river back the cells the road
   // carve heaped up around bridge ends (see carveRoads).
   restoreChannels(hf, flooded, buildings);
+  // Last, with nothing left to draw: plans pinched in two come apart.
+  splitPinched(buildings);
   progress?.('Layout done', 0.7, {buildings});
   return {
     params,
