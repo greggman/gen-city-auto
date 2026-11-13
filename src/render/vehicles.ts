@@ -13,7 +13,7 @@ import {designs} from '../vehicles/designs/index.ts';
 import type {VehicleVariant} from '../workers/vehicle-worker.ts';
 import type {DrawHook, HookCull, Renderer} from './renderer.ts';
 
-const INSTANCE_FLOATS = 44;
+const INSTANCE_FLOATS = 48;
 
 interface Group {
   part: Part;
@@ -83,6 +83,11 @@ export interface VehicleInstance {
   lod?: number;
   /** Skip drawing (still casts shadows when shadowOnly). */
   hidden?: boolean;
+  /**
+   * Cut away the part beyond a plane (a train going into a tunnel): world
+   * points p with dot(p, xyz) > w are not drawn.
+   */
+  clip?: readonly [number, number, number, number];
 }
 
 const tmp = mat4.create();
@@ -561,6 +566,11 @@ export class VehicleRenderer implements DrawHook {
     d[o + 41] = inst.brake;
     d[o + 42] = inst.indicator;
     d[o + 43] = 0.15;
+    const c = inst.clip;
+    d[o + 44] = c ? c[0] : 0;
+    d[o + 45] = c ? c[1] : 0;
+    d[o + 46] = c ? c[2] : 0;
+    d[o + 47] = c ? c[3] : 1;
     g.n++;
   }
 

@@ -13,6 +13,17 @@ interface Line {
   arc: number[];
   total: number;
   stationArcs: number[];
+  /** Tunnels as arc-length intervals (s0, s1, ...), bore to bore. */
+  tunnels: number[];
+}
+
+interface Car {
+  model: Mat4;
+  prev: Mat4;
+  /** In a tunnel: not drawn. */
+  hidden: boolean;
+  /** Going into (or out of) a tunnel: the part past the bore is cut away. */
+  clip: [number, number, number, number] | undefined;
 }
 
 interface Train {
@@ -21,7 +32,7 @@ interface Train {
   s: number;
   speed: number;
   dwell: number;
-  cars: {model: Mat4; prev: Mat4}[];
+  cars: Car[];
   variant: number;
   color2: Vec3;
 }
@@ -82,6 +93,7 @@ export class Trains {
           .map(s => arc[s])
           .filter(a => !terminus(a))
           .sort((a, b) => a - b),
+        tunnels: e.tunnels ?? [],
       });
       if (!variants.length || total < 400) continue;
       const count = e.loop ? 4 : 2;
@@ -103,6 +115,8 @@ export class Trains {
           cars: Array.from({length: ncars}, () => ({
             model: mat4.create(),
             prev: mat4.create(),
+            hidden: false,
+            clip: undefined,
           })),
           variant: rng.pick(variants),
           color2: bands[li % bands.length],
@@ -152,6 +166,8 @@ export class Trains {
         (tr.dir === -1 && s + len > L.total - END_GAP)
       )
         continue;
+      // In the open all the way in (the director never films a tunnel).
+      if (!this.openRun(line, stationArc, dist + len, tr.dir)) continue;
       const clash = this.trains.some((o, j) => {
         if (j === i || o.line !== line || o.dir !== tr.dir) return false;
         let d = Math.abs(o.s - s);
@@ -167,6 +183,30 @@ export class Trains {
       return i;
     }
     return -1;
+  }
+
+  /**
+   * No tunnel on `line` from `back` metres behind arc length s (running
+   * in direction dir) to 30 m past it.
+   */
+  private openRun(line: number, s: number, back: number, dir: 1 | -1) {
+    for (let d = -30; d <= back; d += 4)
+      if (this.inTunnel(line, s - dir * d)) return false;
+    return true;
+  }
+
+  /**
+   * A train of `line` can be staged `dist` metres short of the station at
+   * arc length stationArc (stage) with the whole run in the open, one way
+   * or the other.
+   */
+  openApproach(line: number, stationArc: number, dist: number) {
+    const tr = this.trains.find(t => t.line === line);
+    if (!tr) return false;
+    const len = tr.cars.length * this.carLen;
+    return ([1, -1] as const).some(dir =>
+      this.openRun(line, stationArc, dist + len, dir),
+    );
   }
 
   /** Speed (m/s) of train i; 0 while it stands at a station. */
@@ -255,13 +295,93 @@ export class Trains {
         ];
         c.prev.set(c.model);
         modelMatrix(c.model, p, d, (qf[1] - qr[1]) / l);
+        this.cutAtBores(line, s, c);
       });
     }
+  }
+
+  /**
+   * A car centred at arc length s of `line`: hidden inside a tunnel, cut at
+   * the bore while going in or coming out (the portal's dark opening is
+   * there: gen-base railTunnels).
+   */
+  private cutAtBores(line: Line, s: number, c: Car) {
+    c.hidden = false;
+    c.clip = undefined;
+    const t = line.tunnels;
+    if (!t.length) return;
+    if (line.e.loop) s = ((s % line.total) + line.total) % line.total;
+    const half = this.carLen / 2 + 0.5;
+    for (let k = 0; k < t.length; k += 2) {
+      const a = t[k];
+      const b = t[k + 1];
+      if (s + half <= a || s - half >= b) continue;
+      if (s - half >= a && s + half <= b) {
+        c.hidden = true;
+        return;
+      }
+      // Across one bore (the one nearer the car's centre): the plane
+      // through it, facing into the tunnel.
+      const into = Math.abs(s - a) < Math.abs(s - b) ? 1 : -1;
+      const sb = into > 0 ? a : b;
+      const p = this.at(line, sb);
+      const q = this.at(line, sb + into * 0.5);
+      const dx = q[0] - p[0];
+      const dz = q[2] - p[2];
+      const l = Math.hypot(dx, dz) || 1;
+      c.clip = [dx / l, 0, dz / l, (p[0] * dx + p[2] * dz) / l];
+      return;
+    }
+  }
+
+  /** Arc length s of `line` is in a tunnel. */
+  inTunnel(line: number, s: number) {
+    const L = this.lines[line];
+    if (!L) return false;
+    if (L.e.loop) s = ((s % L.total) + L.total) % L.total;
+    const t = L.tunnels;
+    for (let k = 0; k < t.length; k += 2)
+      if (s > t[k] && s < t[k + 1]) return true;
+    return false;
+  }
+
+  /**
+   * Metres train i runs before its front reaches a tunnel; Infinity if none
+   * within `within` metres. Negative: its front is that far into one.
+   */
+  toTunnel(i: number, within = 1000): number {
+    const tr = this.trains[i];
+    if (!tr) return 0;
+    const L = this.lines[tr.line];
+    if (this.inTunnel(tr.line, tr.s)) {
+      let d = 0;
+      while (d < 2000 && this.inTunnel(tr.line, tr.s - tr.dir * d)) d += 2;
+      return -d;
+    }
+    for (let d = 0; d <= within; d += 2) {
+      // Open lines: trains reverse at the buffers, before any tunnel past.
+      const s = tr.s + tr.dir * d;
+      if (!L.e.loop && (s < 0 || s > L.total)) return Infinity;
+      if (this.inTunnel(tr.line, s)) return d;
+    }
+    return Infinity;
+  }
+
+  /** Train i is wholly out of the tunnels (every car drawn whole). */
+  inOpen(i: number) {
+    const tr = this.trains[i];
+    return !!tr && tr.cars.every(c => !c.hidden && !c.clip);
+  }
+
+  /** The cars of train i that are drawn (not inside a tunnel). */
+  visibleCars(i: number): Car[] {
+    return this.trains[i]?.cars.filter(c => !c.hidden) ?? [];
   }
 
   draw(lights: number) {
     for (const tr of this.trains) {
       for (const c of tr.cars) {
+        if (c.hidden) continue;
         this.vr.add({
           variant: tr.variant,
           model: c.model,
@@ -275,6 +395,7 @@ export class Trains {
           wheelSpin: 0,
           steer: 0,
           rotor: 0,
+          clip: c.clip,
         });
       }
     }

@@ -347,6 +347,10 @@ function finishCity(
   const summary: LayoutSummary = {
     layout: {
       ...rest,
+      elevated: rest.elevated.map((e, i) => ({
+        ...e,
+        tunnels: base.tunnels[i] ?? [],
+      })),
       heights: base.terrainHeights,
       heightN: lt.heights.n,
       cell: lt.heights.cell,
