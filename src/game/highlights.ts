@@ -293,7 +293,13 @@ function stations(inp: HighlightInput): Place[] {
   const out: Place[] = [];
   inp.rail.forEach((l, li) => {
     if (!l.hasTrains) return;
+    const t = l.e.tunnels ?? [];
     for (const sa of l.stationArcs) {
+      // Not an underground station.
+      let under = false;
+      for (let k = 0; k < t.length; k += 2)
+        if (sa > t[k] - 40 && sa < t[k + 1] + 40) under = true;
+      if (under) continue;
       // Station point by arc length.
       let k = 0;
       while (k + 1 < l.arc.length && l.arc[k + 1] < sa) k++;

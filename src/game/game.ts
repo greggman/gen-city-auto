@@ -176,6 +176,8 @@ export class Game {
   private signGrid: SignGrid | null = null;
   /** Train the camera films in a showcase train scene (-1: the nearest). */
   private subjectTrain = -1;
+  /** The train the follow director films (train shots), else -1. */
+  private filmTrain = -1;
   /** Seconds since the last user input (Infinity: none yet). */
   private idleFor = Infinity;
   private fpsAvg = 60;
@@ -556,50 +558,32 @@ export class Game {
         add(c.model, vs[c.variant]?.info.size ?? [1.8, 1.5, 4.5]);
       for (const tr of this.trains?.trains ?? [])
         for (const c of tr.cars)
-          add(c.model, vs[tr.variant]?.info.size ?? [3, 4, 20]);
+          if (!c.hidden) add(c.model, vs[tr.variant]?.info.size ?? [3, 4, 20]);
       return out;
     };
     this.camera.trainCars = () => {
-      // Car positions of the filmed train, else the one nearest the player.
-      const t = this.trains!;
-      const st = t.trains[this.subjectTrain];
-      if (st) return st.cars.map(c => [c.model[12], c.model[13], c.model[14]]);
-      let best: Vec3[] = [];
-      let bd = Infinity;
-      for (const tr of t.trains) {
-        const m = tr.cars[Math.floor(tr.cars.length / 2)]?.model;
-        // Not one in a tunnel.
-        if (!m || m[13] < this.net!.hf.sample(m[12], m[14])) continue;
-        const d = Math.hypot(
-          m[12] - this.player.pos[0],
-          m[14] - this.player.pos[2],
-        );
-        if (d < bd) {
-          bd = d;
-          best = tr.cars.map(c => [c.model[12], c.model[13], c.model[14]]);
-        }
-      }
-      return best;
+      // Car positions of the filmed train (those out of the tunnels).
+      const i = this.filmedTrain();
+      return this.trains!.visibleCars(i).map(
+        c => [c.model[12], c.model[13], c.model[14]] as Vec3,
+      );
     };
     this.camera.trainFocus = () => {
-      // The filmed train, else the nearest train car to the player.
+      // Its middle car (of those out of the tunnels).
+      const cars = this.trains!.visibleCars(this.filmedTrain());
+      const m = cars[Math.floor(cars.length / 2)]?.model;
+      return m ? [m[12], m[13], m[14]] : null;
+    };
+    this.camera.trainAhead = () => {
       const t = this.trains!;
-      if (t.trains[this.subjectTrain]) return t.focusPoint(this.subjectTrain);
-      let best: Vec3 | null = null;
-      let bd = Infinity;
-      for (let i = 0; i < t.trains.length; i++) {
-        const p = t.focusPoint(i);
-        if (!p || p[1] < this.net!.hf.sample(p[0], p[2])) continue;
-        const d = Math.hypot(
-          p[0] - this.player.pos[0],
-          p[2] - this.player.pos[2],
-        );
-        if (d < bd) {
-          bd = d;
-          best = p;
-        }
-      }
-      return best;
+      const i = this.filmedTrain();
+      const tr = t.trains[i];
+      if (!tr) return null;
+      return {
+        dist: t.toTunnel(i),
+        speed: t.speedOf(i),
+        len: tr.cars.length * t.carLen,
+      };
     };
     const sp = this.spawnPoint();
     const vname = this.opts.vehicle;
@@ -776,6 +760,34 @@ export class Game {
     this.player.heliArea = null;
   }
 
+  /**
+   * The train being filmed: the showcase scene's, else the one a train shot
+   * of the follow director took (kept for the shot), else the nearest one to
+   * the player that is out of the tunnels with 80 m of open line ahead.
+   */
+  private filmedTrain(): number {
+    if (this.subjectTrain >= 0) return this.subjectTrain;
+    const t = this.trains!;
+    if (this.filmTrain >= 0 && this.camera.shot?.focus === 'train')
+      return this.filmTrain;
+    let best = -1;
+    let bd = Infinity;
+    for (let i = 0; i < t.trains.length; i++) {
+      const p = t.focusPoint(i);
+      if (!p || !t.inOpen(i) || t.toTunnel(i, 80) < 80) continue;
+      const d = Math.hypot(
+        p[0] - this.player.pos[0],
+        p[2] - this.player.pos[2],
+      );
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    this.filmTrain = best;
+    return best;
+  }
+
   private subjectSpeed(): number {
     const sc = this.showcase?.current;
     if (!sc || sc.subject === 'none') return Infinity;
@@ -941,6 +953,9 @@ export class Game {
       }
       case 'train':
         if (place.line === undefined || place.stationArc === undefined)
+          return null;
+        // Pulling in out of the open, not out of a tunnel.
+        if (!this.trains!.openApproach(place.line, place.stationArc, 220))
           return null;
         // The car (it brings the traffic) on a street near the station.
         if (!car(0)) return null;

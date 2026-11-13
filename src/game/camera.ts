@@ -199,6 +199,12 @@ export class CameraSystem {
   trainFocus: () => Vec3 | null = () => null;
   /** Car positions (rail height) of the train nearest the player, in order. */
   trainCars: () => Vec3[] = () => [];
+  /**
+   * The filmed train: metres its front runs before it reaches a tunnel (0
+   * in one, Infinity if none near), its speed and length.
+   */
+  trainAhead: () => {dist: number; speed: number; len: number} | null = () =>
+    null;
   private decks: DeckSeg[] = [];
   private deckGrid = new Map<number, number[]>();
   /** Most recent shots first, so the director can avoid repeating itself. */
@@ -750,8 +756,14 @@ export class CameraSystem {
         !(
           isHeli && ['bumper', 'interior', 'wheel', 'side', 'rear'].includes(s)
         ) &&
-        !(s === 'train' && !this.nearTrain(pl)) &&
-        !(s === 'trainpace' && this.trainCars().length < 2),
+        !(
+          s === 'train' &&
+          (!this.nearTrain(pl) || this.trainRoom('train') < 2.5)
+        ) &&
+        !(
+          s === 'trainpace' &&
+          (this.trainCars().length < 2 || this.trainRoom('trainpace', 28) < 2.5)
+        ),
     );
     const last = this.recent[0];
     for (let attempt = 0; attempt < 16; attempt++) {
@@ -869,6 +881,9 @@ export class CameraSystem {
             : g + this.rng.range(1.6, 4);
           s.eye = [x, y, z];
           s.fov = this.rng.range(0.6, 0.85);
+          // Cut before the train is gone into a tunnel.
+          s.dur = Math.min(s.dur, this.trainRoom('train'));
+          if (s.dur < 2.5) continue;
           break;
         }
         case 'trainpace': {
@@ -880,6 +895,9 @@ export class CameraSystem {
           const v = this.paceView(s);
           if (!v) continue;
           s.eye = v.eye;
+          // Never into the hillside after it.
+          s.dur = Math.min(s.dur, this.trainRoom('trainpace', s.a));
+          if (s.dur < 2.5) continue;
           break;
         }
         case 'orbit': {
@@ -957,22 +975,42 @@ export class CameraSystem {
       return s;
     }
     // A train scene with no clear framing: pace the train anyway (beside
-    // the viaduct is rarely obstructed) rather than chase the parked car.
+    // the viaduct is rarely obstructed) rather than chase the parked car;
+    // only from an eye the cut-away checks (directed) would not throw out
+    // at once, else the director cut back to it every frame.
     if (this.allowed?.has('trainpace') && this.trainCars().length >= 2) {
-      const s: ShotState = {
-        name: 'trainpace',
-        t: 0,
-        dur: 7,
-        eye: [0, 0, 0],
-        a: 20,
-        r: 14,
-        h: 4,
-        side: this.rng.chance(0.5) ? 1 : -1,
-        fov: 0.7,
-        focus: 'train',
-      };
-      s.eye = this.paceView(s)!.eye;
-      return s;
+      const first = this.rng.chance(0.5) ? 1 : -1;
+      for (const [a, r, h] of [
+        [20, 14, 4],
+        [16, 12, 7],
+        [26, 18, 2],
+      ])
+        for (const side of [first, -first]) {
+          const room = this.trainRoom('trainpace', a);
+          if (room < 2.5) continue;
+          const s: ShotState = {
+            name: 'trainpace',
+            t: 0,
+            dur: Math.min(7, room),
+            eye: [0, 0, 0],
+            a,
+            r,
+            h,
+            side,
+            fov: 0.7,
+            focus: 'train',
+          };
+          const v = this.paceView(s)!;
+          if (
+            this.badEye(v.eye) ||
+            this.centreHit(v.eye, v.look, s.fov) ||
+            this.crowded(v.eye, v.look, s.fov) ||
+            this.blocked(v.eye, v.look)
+          )
+            continue;
+          s.eye = v.eye;
+          return s;
+        }
     }
     return {
       name: 'chase',
@@ -986,6 +1024,29 @@ export class CameraSystem {
       fov: 0.9,
       focus: 'player',
     };
+  }
+
+  /**
+   * Seconds a train shot may run before the filmed train goes into a
+   * tunnel: a static shot ('train') until a little under half of it has
+   * gone in (the camera watches it enter the portal), one pacing it
+   * ('trainpace', the eye `lead` metres ahead of its front) until the eye
+   * is 15 m short of the portal. 0 if it is in a tunnel already. (The
+   * train taken to speed up as fast as it can, so this errs short.)
+   */
+  private trainRoom(name: string, lead = 0): number {
+    const t = this.trainAhead();
+    if (!t || !this.trainCars().length) return 0;
+    if (t.dist === Infinity) return Infinity;
+    const d = name === 'trainpace' ? t.dist - lead - 15 : t.dist + t.len * 0.4;
+    if (d <= 0) return 0;
+    const v0 = t.speed;
+    const vmax = Math.max(v0, 20);
+    const acc = 0.8;
+    const tAcc = (vmax - v0) / acc;
+    const dAcc = v0 * tAcc + 0.5 * acc * tAcc * tAcc;
+    if (d <= dAcc) return (-v0 + Math.sqrt(v0 * v0 + 2 * acc * d)) / acc;
+    return tAcc + (d - dAcc) / vmax;
   }
 
   private nearTrain(pl: Player) {
@@ -1227,6 +1288,12 @@ export class CameraSystem {
     s.t += dt;
     s.shown = (s.shown ?? 0) + dt;
     pl.hidden = false;
+    // The filmed train gone into a tunnel: on to the next shot (never
+    // chase it underground).
+    if (s.focus === 'train' && !this.trainCars().length) {
+      this.shot = this.newShot(pl);
+      return this.directedRaw(0, pl);
+    }
     const p = pl.pos;
     const f = pl.forward;
     const r: Vec3 = [-f[1], 0, f[0]];
