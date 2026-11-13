@@ -2968,6 +2968,127 @@ function eavePlan(poly: Vec2[], d: number, max: number): Vec2[] | null {
     : null;
 }
 
+/** A house roof's overhang past its walls, and most a sharp corner's may. */
+const EAVE = 0.45;
+const EAVE_MAX = 0.58;
+/** Depth of the fascia board down from the roof's edge (m). */
+const FASCIA = 0.2;
+
+/** The LOD (eave trim is LOD0 only) and the trim's materials. */
+interface EaveTrim {
+  lod: number;
+  fascia: number;
+  soffit: number;
+}
+
+/**
+ * The eave's trim, so it is not a paper-thin sheet from below or edge on: a
+ * fascia board down from the roof's edge all round and a soffit under the
+ * overhang back to the walls. LOD0 only: from LOD1's range (past 250 m) a
+ * 0.2 m board is under half a pixel high. The roof over wall i's
+ * overhang is the lower envelope of `planesOf(i)`; on a gable's rake the
+ * board and soffit follow it up. `plan` is `fp` grown by the overhang
+ * (corner for corner); none if it has none.
+ */
+function eaveTrim(
+  m: CMesh,
+  fp: Vec2[],
+  plan: Vec2[],
+  planesOf: (i: number) => RoofPlane[],
+  trim: EaveTrim,
+  aux: number,
+) {
+  if (plan === fp || trim.lod > 0) return;
+  const n = fp.length;
+  const down: Vec3 = [0, -1, 0];
+  for (let i = 0; i < n; i++) {
+    const P = planesOf(i);
+    const A = plan[i],
+      C = plan[(i + 1) % n];
+    const a = fp[i],
+      c = fp[(i + 1) % n];
+    // Where the roof along the eave changes plane (a gable's ridge).
+    const ts = [0, 1];
+    for (let p = 0; p < P.length; p++)
+      for (let q = p + 1; q < P.length; q++) {
+        const dA = planeAt(P[p], A) - planeAt(P[q], A);
+        const dC = planeAt(P[p], C) - planeAt(P[q], C);
+        if (dA > 0 !== dC > 0 && Math.abs(dA - dC) > 1e-9) {
+          const t = dA / (dA - dC);
+          if (t > 1e-4 && t < 1 - 1e-4) ts.push(t);
+        }
+      }
+    ts.sort((x, y) => x - y);
+    // Keep only the breaks where the lowest plane does change.
+    const low = (t: number) => {
+      const e: Vec2 = [A[0] + (C[0] - A[0]) * t, A[1] + (C[1] - A[1]) * t];
+      let k = 0;
+      for (let j = 1; j < P.length; j++)
+        if (planeAt(P[j], e) < planeAt(P[k], e)) k = j;
+      return k;
+    };
+    for (let k = ts.length - 2; k > 0; k--)
+      if (low((ts[k - 1] + ts[k]) / 2) === low((ts[k] + ts[k + 1]) / 2))
+        ts.splice(k, 1);
+    const len = dist2(A, C);
+    const depth = dist2(a, A);
+    const at = (p: Vec2, q: Vec2, t: number): Vec2 => [
+      p[0] + (q[0] - p[0]) * t,
+      p[1] + (q[1] - p[1]) * t,
+    ];
+    const pts = ts.map(t => {
+      const e = at(A, C, t);
+      return {
+        t,
+        e,
+        w: at(a, c, t),
+        y: Math.min(...P.map(Q => planeAt(Q, e))),
+      };
+    });
+    const out = edgeNormal(fp, i);
+    for (let k = 0; k + 1 < pts.length; k++) {
+      const p = pts[k],
+        q = pts[k + 1];
+      const u0 = p.t * len,
+        u1 = q.t * len;
+      m.quad(
+        [
+          [p.e[0], p.y, p.e[1]],
+          [q.e[0], q.y, q.e[1]],
+          [q.e[0], q.y - FASCIA, q.e[1]],
+          [p.e[0], p.y - FASCIA, p.e[1]],
+        ],
+        out,
+        [
+          [u0, FASCIA],
+          [u1, FASCIA],
+          [u1, 0],
+          [u0, 0],
+        ],
+        trim.fascia,
+        aux,
+      );
+      m.quad(
+        [
+          [p.e[0], p.y - FASCIA, p.e[1]],
+          [q.e[0], q.y - FASCIA, q.e[1]],
+          [q.w[0], q.y - FASCIA, q.w[1]],
+          [p.w[0], p.y - FASCIA, p.w[1]],
+        ],
+        down,
+        [
+          [u0, 0],
+          [u1, 0],
+          [u1, depth],
+          [u0, depth],
+        ],
+        trim.soffit,
+        aux,
+      );
+    }
+  }
+}
+
 /**
  * A pitched roof over CCW footprint `fp` with its eaves at `eaves`: the
  * lower envelope of `planes` (each at least `eaves` over the footprint), out
@@ -2982,8 +3103,10 @@ function pitchedRoof(
   roofMat: number,
   wallMat: number,
   aux: number,
+  trim: EaveTrim,
 ) {
-  const plan = eavePlan(fp, 0.45, 0.58) ?? fp;
+  const plan = eavePlan(fp, EAVE, EAVE_MAX) ?? fp;
+  eaveTrim(m, fp, plan, () => planes, trim, aux);
   const pieces = isConvex(plan)
     ? [plan]
     : (() => {
@@ -3094,6 +3217,7 @@ function houseRoof(
   roofMat: number,
   wallMat: number,
   aux: number,
+  trim: EaveTrim,
 ) {
   const slope = 0.55;
   const maxRise = 4;
@@ -3132,7 +3256,7 @@ function houseRoof(
     }
   }
   planes.push([0, 0, eaves + maxRise]);
-  pitchedRoof(m, fp, eaves, planes, roofMat, wallMat, aux);
+  pitchedRoof(m, fp, eaves, planes, roofMat, wallMat, aux, trim);
 }
 
 /**
@@ -3264,6 +3388,19 @@ export function building(
         packMat(CM.tile, b.style & 0xffff),
         packMat(CM.facade, facadeParam(b, false, false)),
         aux,
+        {
+          lod,
+          // Fascia in the facade's accent, soffit in its body tone; both
+          // plain (no windows).
+          fascia: packMat(
+            CM.facade,
+            facadeParam(b, false, false, 0, FZ.crown, true),
+          ),
+          soffit: packMat(
+            CM.facade,
+            facadeParam(b, false, false, 0, FZ.trim, true),
+          ),
+        },
       );
     if (lod === 0 && rng.chance(0.5)) {
       // Small AC unit and a garden wall.

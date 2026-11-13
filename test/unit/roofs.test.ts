@@ -185,3 +185,43 @@ void test('flat house roofs keep inside their walls', () => {
         }
       }
 });
+
+void test('eaves have a fascia and a soffit at LOD0', () => {
+  useCityRoofs('metro');
+  for (const name of ['rect', 'pentagon', 'ell', 'notch']) {
+    const fp = PLANS[name];
+    const count = (lod: number) => {
+      const b = house(fp, 0);
+      const m = new CMesh(256, 512);
+      building(b, m, lod, new LightList(), 0);
+      const eaves = solidTop(b);
+      let down = 0,
+        out = 0;
+      for (let t = 0; t < m.icount; t += 3) {
+        const v = [0, 1, 2].map(k => m.idx[t + k] * VERTEX_WORDS);
+        if (v.some(o => (m.u32[o + 6] & 0xff) !== CM.facade)) continue;
+        if (v.some(o => m.f32[o + 1] < eaves - 0.8)) continue;
+        const ax = m.f32[v[1]] - m.f32[v[0]],
+          ay = m.f32[v[1] + 1] - m.f32[v[0] + 1],
+          az = m.f32[v[1] + 2] - m.f32[v[0] + 2];
+        const bx = m.f32[v[2]] - m.f32[v[0]],
+          by = m.f32[v[2] + 1] - m.f32[v[0] + 1],
+          bz = m.f32[v[2] + 2] - m.f32[v[0] + 2];
+        // Winding normal's y: soffits face down (tilted up a gable's
+        // rake), fascias (out at the eave line) sideways.
+        const ny = az * bx - ax * bz;
+        const nl = Math.hypot(ay * bz - az * by, ny, ax * by - ay * bx);
+        const past = v.some(o => outside([m.f32[o], m.f32[o + 2]], fp) > 0.3);
+        if (ny < -0.7 * nl) down++;
+        else if (Math.abs(ny) < 0.1 * nl && past) out++;
+      }
+      return {down, out};
+    };
+    const l0 = count(0),
+      l1 = count(1);
+    assert.ok(l0.out >= 2 * fp.length, `${name}: fascia ${l0.out}`);
+    assert.ok(l0.down >= 2 * fp.length, `${name}: soffit ${l0.down}`);
+    assert.equal(l1.out, 0, `${name} lod 1: fascia`);
+    assert.equal(l1.down, 0, `${name} lod 1: soffit`);
+  }
+});
