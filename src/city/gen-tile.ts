@@ -3251,7 +3251,10 @@ export function building(
       aux,
     );
     cap(m, fp, eaves, packMat(CM.roof, b.style & 0xffff), aux);
-    if (flatHouse(b)) houseFlatRoof(m, b, fp, eaves, lod, concrete, aux);
+    // (A plan pinched in two at a corner, which a few lots still are, gets
+    // a flat roof: a roof over it would bridge the pinch.)
+    if (flatHouse(b) || simplePolygon(fp) !== fp)
+      houseFlatRoof(m, b, fp, eaves, lod, concrete, aux);
     else
       houseRoof(
         m,
