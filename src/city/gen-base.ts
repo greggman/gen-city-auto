@@ -5,6 +5,7 @@
 import {release} from '../mem.ts';
 import {Rng, hash2} from '../math/random.ts';
 import {
+  clamp,
   dist2,
   lerp,
   pointInPolygon,
@@ -32,6 +33,7 @@ import {
   closestOnPolyline,
   elevatedHalfWidth,
   inTunnel,
+  type Building,
   type CityLayout,
   type Elevated,
 } from './layout.ts';
@@ -2070,13 +2072,26 @@ function elevatedStructures(
     fallback();
     return true;
   };
+  const clearance = portalClearance(L, inRoad);
+  const tunnels: number[][] = [];
   L.elevated.forEach((e, ei) => {
+    tunnels.push([]);
     if (e.kind === 'rail') {
       const i0 = m.icount;
       const l0 = lights.data.length;
       railViaduct(e, ei, hf, onRoad, inRoad, pier, m, lights, solid);
       railBufferStops(e, m);
-      railTunnels(e, hf, m, i0, lights, l0, inRoad);
+      tunnels[ei] = railTunnels(
+        e,
+        hf,
+        m,
+        i0,
+        lights,
+        l0,
+        inRoad,
+        clearance,
+        solid,
+      );
     } else {
       // Piers on the boulevard's median, out of junction boxes (0); 2
       // clear of the crossings and of any other road beside it, 1 on a
@@ -2096,6 +2111,69 @@ function elevatedStructures(
       expressway(e, hf, pier, m, lights, ok, legOk, solid);
     }
   });
+  return tunnels;
+}
+
+/**
+ * How far q is (m, up to 10) from the nearest building or from a road with
+ * its pavement (3 m past the carriageway): portal mounds fall away 1:1
+ * towards them.
+ */
+function portalClearance(
+  L: CityLayout,
+  inRoad: (q: Vec2, r: number) => boolean,
+) {
+  const G = 64;
+  let grid: Map<number, Building[]> | null = null;
+  const key = (x: number, z: number) =>
+    (Math.floor(z / G) + 1024) * 2048 + Math.floor(x / G) + 1024;
+  const build = () => {
+    const g = new Map<number, Building[]>();
+    for (const b of L.buildings) {
+      let x0 = Infinity,
+        x1 = -Infinity,
+        z0 = Infinity,
+        z1 = -Infinity;
+      for (const q of b.footprint) {
+        x0 = Math.min(x0, q[0]);
+        x1 = Math.max(x1, q[0]);
+        z0 = Math.min(z0, q[1]);
+        z1 = Math.max(z1, q[1]);
+      }
+      for (
+        let z = Math.floor((z0 - 10) / G);
+        z <= Math.floor((z1 + 10) / G);
+        z++
+      )
+        for (
+          let x = Math.floor((x0 - 10) / G);
+          x <= Math.floor((x1 + 10) / G);
+          x++
+        ) {
+          const k = (z + 1024) * 2048 + x + 1024;
+          let l = g.get(k);
+          if (!l) g.set(k, (l = []));
+          l.push(b);
+        }
+    }
+    return g;
+  };
+  return (q: Vec2) => {
+    let d = 10;
+    for (const r of [0, 1, 2, 3, 4, 6, 8])
+      if (inRoad(q, r + 3)) {
+        d = r;
+        break;
+      }
+    grid ??= build();
+    for (const b of grid.get(key(q[0], q[1])) ?? []) {
+      const f = b.footprint;
+      if (pointInPolygon(q, f)) return 0;
+      for (let i = 0; i < f.length; i++)
+        d = Math.min(d, pointSegment(q, f[i], f[(i + 1) % f.length])[0]);
+    }
+    return d;
+  };
 }
 
 /**
@@ -2268,22 +2346,45 @@ function railBufferStops(e: Elevated, m: CMesh) {
 /** Farthest a tunnel mouth moves along its line off a road (points). */
 const PORTAL_REACH = 40;
 /**
- * Most a moved mouth leaves the deck over the ground where the tunnel now
- * runs on, or under it where the cutting now runs on (m).
+ * Most a mouth moved out over the approach leaves the deck over the ground
+ * where the tunnel now runs on (m): the covered way there is buried under
+ * the portal's mound (portalMound).
  */
-const PORTAL_SLACK = 4;
+const PORTAL_SLACK = 8;
+/**
+ * Most a mouth moved into the hill leaves the deck under the ground where
+ * the line now runs on in the open (m): nothing is dug out there, so
+ * deeper than this the train would run through the hillside.
+ */
+const PORTAL_SLACK_IN = 0.6;
+/** Half width of a portal's headwall (wing posts outside the opening). */
+const PORTAL_HALF = 7.2;
+/** A narrower headwall where the full one can't stand off the roads. */
+const PORTAL_HALF_NARROW = 5.6;
+
+/** A tunnel portal of a rail line (tunnelPlan). */
+export interface PortalSpot {
+  /** Between points i and i + 1, at fraction t of the way. */
+  i: number;
+  t: number;
+  /** +1: the tunnel is towards i + 1 (into the hill along the index). */
+  s: 1 | -1;
+  /** Headwall half width (PORTAL_HALF, or PORTAL_HALF_NARROW). */
+  half: number;
+}
 
 /**
  * Which points of a rail line are in a tunnel (its deck under the ground,
- * layout elevateProfile), and which tunnel mouths get a portal. A mouth
- * whose headwall or bore would stand on a road (the line comes out of the
- * hill where a road is cut into it, or runs on under the road) moves along
- * the line to the nearest spot clear of every road: out over the open
- * approach (the tunnel runs on under the road, a short open window between
- * two tunnels closes) or into the hill (the line runs on in a cutting, off
- * the roads), whichever is nearer and leaves the deck no more than
- * PORTAL_SLACK over or under the ground. A mouth with nowhere to go gets no
- * portal: the deck runs into the ground.
+ * layout elevateProfile), and where its portals stand. A mouth whose
+ * headwall or bore would stand on a road (the line comes out of the hill
+ * where a road is cut into it, or runs on under the road) moves along the
+ * line to the nearest spot clear of every road: out over the open approach
+ * (the tunnel runs on under the road and the portal's mound, a short open
+ * window between two tunnels closes; at most PORTAL_SLACK over the ground)
+ * or into the hill (at most PORTAL_SLACK_IN under it), whichever is nearer.
+ * One with nowhere to go gets a narrower headwall where that stands clear,
+ * else no portal (noPortal: the deck runs into the ground). A portal that
+ * did not move stands where the deck meets the ground.
  */
 export function tunnelPlan(
   e: Elevated,
@@ -2291,31 +2392,43 @@ export function tunnelPlan(
   inRoad: (q: Vec2, r: number) => boolean,
   slack = PORTAL_SLACK,
   reach = PORTAL_REACH,
-): {under: boolean[]; noPortal: Set<number>} {
+): {under: boolean[]; noPortal: Set<number>; portals: PortalSpot[]} {
   const n = e.pts.length;
-  const under = e.pts.map((_, i) => inTunnel(e, i, hf));
+  const raw = e.pts.map((_, i) => inTunnel(e, i, hf));
+  const under = raw.slice();
   const noPortal = new Set<number>();
-  if (!under.some(u => u)) return {under, noPortal};
+  const portals: PortalSpot[] = [];
+  if (!under.some(u => u)) return {under, noPortal, portals};
   const fr = frames(e.pts);
   const over = (i: number) =>
     e.heights[i] - hf.sample(e.pts[i][0], e.pts[i][1]);
-  // The portal between points i and i + 1 facing out of the hill on side
-  // s (+1: the tunnel is at i + 1): its headwall (14 m wide) and the bore
-  // a few metres in, a metre clear of every carriageway.
-  const clear = (i: number, s: number) => {
+  // The portal at fraction f of the way from point i to i + 1 facing out
+  // of the hill on side s (+1: the tunnel is at i + 1): its headwall (half
+  // width `half`) and the bore behind it, `r` clear of every carriageway.
+  const clearAt = (
+    i: number,
+    s: number,
+    f = 0.5,
+    half = PORTAL_HALF,
+    r = 1,
+  ) => {
     const a = e.pts[i];
     const b = e.pts[i + 1];
     const {d, l} = fr[i];
+    const c: Vec2 = [lerp(a[0], b[0], f), lerp(a[1], b[1], f)];
+    const lats = Math.ceil((half + 0.3) / 1.5);
     for (let al = -1; al <= 4; al += 1.25)
-      for (let lat = -7.5; lat <= 7.5; lat += 1.5) {
+      for (let k = -lats; k <= lats; k++) {
+        const lat = (k / lats) * (half + 0.3);
         const q: Vec2 = [
-          (a[0] + b[0]) / 2 + d[0] * s * al + l[0] * lat,
-          (a[1] + b[1]) / 2 + d[1] * s * al + l[1] * lat,
+          c[0] + d[0] * s * al + l[0] * lat,
+          c[1] + d[1] * s * al + l[1] * lat,
         ];
-        if (inRoad(q, 1)) return false;
+        if (inRoad(q, r)) return false;
       }
     return true;
   };
+  const clear = (i: number, s: number) => clearAt(i, s);
   for (let pass = 0; pass < 4; pass++) {
     let moved = false;
     for (let b = 1; b < n; b++) {
@@ -2341,7 +2454,7 @@ export function tunnelPlan(
           // across it).
           if (way > 0 && inRoad(e.pts[k], elevatedHalfWidth(e))) break;
           worst = Math.max(worst, way < 0 ? over(k) : -over(k));
-          if (worst > slack) break;
+          if (worst > (way < 0 ? slack : PORTAL_SLACK_IN)) break;
           toggle.push(k);
           // Merged into the next tunnel / open run.
           const merged = under[next] === way < 0;
@@ -2363,14 +2476,77 @@ export function tunnelPlan(
     }
     if (!moved) break;
   }
-  return {under, noPortal};
+  for (let i = 0; i + 1 < n; i++) {
+    if (under[i] === under[i + 1]) continue;
+    const s = under[i + 1] ? 1 : -1;
+    let half = PORTAL_HALF;
+    let t = 0.5;
+    if (noPortal.has(i + 1)) {
+      // Anywhere along the mouth's segment, the full headwall or a narrower
+      // one half a metre off the roads.
+      const spot = [PORTAL_HALF, PORTAL_HALF_NARROW]
+        .flatMap(h => [0.5, 0.35, 0.65, 0.2, 0.8, 0, 1].map(f => [h, f]))
+        .find(([h, f]) => clearAt(i, s, f, h, h === PORTAL_HALF ? 1 : 0.5));
+      if (!spot) continue;
+      noPortal.delete(i + 1);
+      [half, t] = spot;
+      portals.push({i, t, s, half});
+      continue;
+    }
+    // Where the deck meets the ground, for a mouth that did not move (and
+    // whose headwall stands clear there too).
+    if (raw[i] === under[i] && raw[i + 1] === under[i + 1]) {
+      const a = over(i);
+      const b = over(i + 1);
+      const f = clamp(a / (a - b || 1), 0.15, 0.85);
+      if (clearAt(i, s, f, half, half === PORTAL_HALF ? 1 : 0.5)) t = f;
+    }
+    portals.push({i, t, s, half});
+  }
+  return {under, noPortal, portals};
+}
+
+/** Portal opening: half width (both tracks) and height over the deck. */
+const BORE_HALF = 4.6;
+const BORE_TOP = 6.6;
+/** Top of a portal's headwall over the deck; its mound comes up to it. */
+const PORTAL_TOP = 7.6;
+/**
+ * How far behind a headwall's face its dark bore stands: trains are cut
+ * there (Trains), and the tunnel's arc-length interval starts there.
+ */
+const BORE_IN = 0.5;
+/** A portal mound's crest: half width, and its side slope (run per metre). */
+const MOUND_CREST = 6.5;
+const MOUND_RUN = 1.3;
+
+/** Arc length at each point of a polyline. */
+function arcLengths(pts: Vec2[]) {
+  const arc = [0];
+  for (let i = 1; i < pts.length; i++)
+    arc.push(arc[i - 1] + dist2(pts[i - 1], pts[i]));
+  return arc;
+}
+
+/** A tunnel portal's face: centre, deck height, into the hill, lateral. */
+interface PortalFace {
+  c: Vec2;
+  h: number;
+  into: Vec2;
+  l: Vec2;
+  /** Arc length of the face along its line. */
+  s: number;
 }
 
 /**
- * Rail lines run through hills in tunnels (tunnelPlan): leave out
- * everything built (from triangle i0 and light l0 on) nearest a point of the
- * line whose deck is under the ground, and close each tunnel mouth with a
- * portal: a concrete headwall round a dark opening.
+ * Rail lines run through hills in tunnels (tunnelPlan). Leaves out what was
+ * built (from triangle i0 and light l0 on) over the buried line: whatever
+ * is nearest a point in a tunnel, except round a portal, where the cut is
+ * the portal's face (the deck runs on a segment into its mound; the masts,
+ * gantries and wires stop at the headwall). Each portal is a concrete
+ * headwall round a dark opening with the hillside brought up to its top
+ * behind it (portalMound). Returns the line's tunnels as arc-length
+ * intervals (s0, s1, ...) from bore to bore, where trains are not drawn.
  */
 function railTunnels(
   e: Elevated,
@@ -2380,10 +2556,29 @@ function railTunnels(
   lights: LightList,
   l0: number,
   inRoad: (q: Vec2, r: number) => boolean,
-) {
+  clearance: (q: Vec2) => number,
+  solid: Solid,
+): number[] {
   const n = e.pts.length;
-  const {under, noPortal} = tunnelPlan(e, hf, inRoad);
-  if (!under.some(u => u)) return;
+  const {under, portals} = tunnelPlan(e, hf, inRoad);
+  if (!under.some(u => u)) return [];
+  const arc = arcLengths(e.pts);
+  const faces: PortalFace[] = portals.map(p => {
+    const a = e.pts[p.i];
+    const b = e.pts[p.i + 1];
+    const len = dist2(a, b) || 1;
+    const into: Vec2 = [
+      ((b[0] - a[0]) / len) * p.s,
+      ((b[1] - a[1]) / len) * p.s,
+    ];
+    return {
+      c: [lerp(a[0], b[0], p.t), lerp(a[1], b[1], p.t)],
+      h: lerp(e.heights[p.i], e.heights[p.i + 1], p.t),
+      into,
+      l: [-into[1], into[0]],
+      s: lerp(arc[p.i], arc[p.i + 1], p.t),
+    };
+  });
   const G = 16;
   const grid = new Map<number, number[]>();
   const key = (gx: number, gz: number) => (gz + 4096) * 8192 + gx + 4096;
@@ -2393,7 +2588,17 @@ function railTunnels(
     if (!l) grid.set(k, (l = []));
     l.push(i);
   });
-  const buried = (x: number, z: number) => {
+  const buried = (x: number, y: number, z: number) => {
+    for (const f of faces) {
+      const dx = x - f.c[0];
+      const dz = z - f.c[1];
+      const al = dx * f.into[0] + dz * f.into[1];
+      if (al < -12 || al > 12 || Math.abs(dx * f.l[0] + dz * f.l[1]) > 16)
+        continue;
+      // The deck runs on into the mound (no gap in front of the headwall
+      // where a triangle of it straddles the face); what stands on it stops.
+      return al > 11 || (al > BORE_IN && y > f.h + 1.6 + al * 0.05);
+    }
     const gx = Math.floor(x / G);
     const gz = Math.floor(z / G);
     let bi = -1;
@@ -2415,7 +2620,14 @@ function railTunnels(
     const a = m.pos(m.idx[t]);
     const b = m.pos(m.idx[t + 1]);
     const c = m.pos(m.idx[t + 2]);
-    if (buried((a[0] + b[0] + c[0]) / 3, (a[2] + b[2] + c[2]) / 3)) continue;
+    if (
+      buried(
+        (a[0] + b[0] + c[0]) / 3,
+        Math.max(a[1], b[1], c[1]),
+        (a[2] + b[2] + c[2]) / 3,
+      )
+    )
+      continue;
     m.idx[w++] = m.idx[t];
     m.idx[w++] = m.idx[t + 1];
     m.idx[w++] = m.idx[t + 2];
@@ -2424,52 +2636,318 @@ function railTunnels(
   const L = lights.data;
   let lw = l0;
   for (let k = l0; k < L.length; k += LIGHT_FLOATS) {
-    if (buried(L[k], L[k + 2])) continue;
+    if (buried(L[k], L[k + 1], L[k + 2])) continue;
     for (let j = 0; j < LIGHT_FLOATS; j++) L[lw + j] = L[k + j];
     lw += LIGHT_FLOATS;
   }
   L.length = lw;
-  // Portals where the line goes under: the opening spans both tracks
-  // (9.2 m) and 7.4 m over the deck, in a 14 m wide, 0.9 m thick headwall.
+  // The tunnels, bore to bore (mid-segment at a mouth with no portal, past
+  // the end where a line ends underground).
+  const tunnels: number[] = [];
+  const bound = (i: number) => {
+    const k = portals.findIndex(p => p.i === i);
+    return k < 0
+      ? (arc[i] + arc[i + 1]) / 2
+      : faces[k].s + portals[k].s * BORE_IN;
+  };
+  for (let i = 0; i < n;) {
+    if (!under[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j + 1 < n && under[j + 1]) j++;
+    tunnels.push(
+      i === 0 ? -1000 : bound(i - 1),
+      j === n - 1 ? arc[n - 1] + 1000 : bound(j),
+    );
+    i = j + 1;
+  }
+  // Portals: the opening spans both tracks (9.2 m) and 6.6 m over the
+  // deck, in a 0.9 m thick headwall 7.6 m tall.
   const conc = packMat(CM.concrete);
-  const fr = frames(e.pts);
-  for (let i = 0; i + 1 < n; i++) {
-    if (under[i] === under[i + 1] || noPortal.has(i + 1)) continue;
-    const a = e.pts[i];
-    const b = e.pts[i + 1];
-    const mid: Vec2 = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-    const h = (e.heights[i] + e.heights[i + 1]) / 2;
-    const {d, l} = fr[i];
-    // Unit vector into the hill.
-    const s = under[i + 1] ? 1 : -1;
-    const yaw = Math.atan2(d[0], d[1]);
-    const at = (along: number, lat: number, y: number): Vec3 => [
-      mid[0] + d[0] * s * along + l[0] * lat,
-      h + y,
-      mid[1] + d[1] * s * along + l[1] * lat,
+  portals.forEach((p, k) => {
+    const f = faces[k];
+    const yaw = Math.atan2(f.into[0], f.into[1]);
+    const at = (al: number, lat: number, y: number): Vec3 => [
+      f.c[0] + f.into[0] * al + f.l[0] * lat,
+      f.h + y,
+      f.c[1] + f.into[1] * al + f.l[1] * lat,
     ];
+    const postHalf = (p.half - BORE_HALF) / 2;
+    const postLat = (p.half + BORE_HALF) / 2;
+    let low = 0;
     for (const side of [-1, 1]) {
       // Down to the ground where a mouth moved out over the approach
       // (tunnelPlan) stands above it.
-      const p = at(0, side * 5.8, 0);
-      const drop = Math.max(0, h - 2.4 - (hf.sample(p[0], p[2]) - 0.5));
+      const q = at(0, side * postLat, 0);
+      const drop = Math.max(0, f.h - 2.4 - (hf.sample(q[0], q[2]) - 0.5));
+      low = Math.max(low, drop);
+      const bottom = -2.4 - drop;
       m.box(
-        at(0, side * 5.8, 3.2 - drop / 2),
-        [1.2, 5.6 + drop / 2, 0.45],
+        at(0, side * postLat, (PORTAL_TOP + bottom) / 2),
+        [postHalf, (PORTAL_TOP - bottom) / 2, 0.45],
         conc,
         yaw,
         0,
         false,
       );
     }
-    m.box(at(0, 0, 8.1), [7.0, 0.7, 0.45], conc, yaw, 0, false);
+    m.box(
+      at(0, 0, (BORE_TOP + PORTAL_TOP) / 2),
+      [BORE_HALF, (PORTAL_TOP - BORE_TOP) / 2, 0.45],
+      conc,
+      yaw,
+      0,
+      false,
+    );
     // Coping along the top.
-    m.box(at(-0.1, 0, 8.9), [7.2, 0.1, 0.6], conc, yaw, 0, false);
-    // The dark bore a few metres in.
-    m.box(at(3, 0, 3.6), [4.6, 3.8, 0.1], packMat(CM.paint, 0x91), yaw);
-  }
+    m.box(
+      at(-0.1, 0, PORTAL_TOP + 0.1),
+      [p.half + 0.2, 0.1, 0.6],
+      conc,
+      yaw,
+      0,
+      false,
+    );
+    // The dark bore just behind the face (trains are cut there).
+    m.box(
+      at(BORE_IN, 0, (BORE_TOP - 0.8) / 2),
+      [BORE_HALF, (BORE_TOP + 0.8) / 2, 0.05],
+      packMat(CM.paint, 0x91),
+      yaw,
+    );
+    solid(
+      at(0, 0, (PORTAL_TOP - 2.4 - low) / 2),
+      [p.half, (PORTAL_TOP + 2.4 + low) / 2, 0.45],
+      yaw,
+    );
+    // The tunnel this portal opens, to its far end.
+    const b = f.s + p.s * BORE_IN;
+    const ti = tunnels.findIndex(v => Math.abs(v - b) < 1e-6);
+    const other = ti < 0 ? Infinity : tunnels[ti ^ 1];
+    portalMound(e, arc, p, f, Math.abs(other - f.s), hf, clearance, m, solid);
+  });
+  return tunnels;
 }
 
+/** Point, deck height and unit direction of a line at arc length s. */
+function lineAt(e: Elevated, arc: number[], s: number) {
+  const n = e.pts.length;
+  s = clamp(s, 0, arc[n - 1]);
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (arc[mid] <= s) lo = mid;
+    else hi = mid;
+  }
+  const a = e.pts[lo];
+  const b = e.pts[hi];
+  const len = arc[hi] - arc[lo] || 1;
+  const t = (s - arc[lo]) / len;
+  return {
+    p: [lerp(a[0], b[0], t), lerp(a[1], b[1], t)] as Vec2,
+    h: lerp(e.heights[lo], e.heights[hi], t),
+    d: [(b[0] - a[0]) / len, (b[1] - a[1]) / len] as Vec2,
+  };
+}
+
+/**
+ * The hillside over a portal: a grass mound behind the headwall, level with
+ * its top for 6 m and falling 1:2 into the hill beyond (or kept over the
+ * tunnel while the ground there is under the deck: a covered way where the
+ * mouth moved out over the approach), its sides falling 1:1.3. It sinks
+ * into the ground wherever the ground is higher, and keeps clear of the
+ * roads (with their pavements) and buildings by falling 1:1 towards them
+ * (`clearance`). Wing walls close its sides at the face.
+ */
+function portalMound(
+  e: Elevated,
+  arc: number[],
+  p: PortalSpot,
+  f: PortalFace,
+  length: number,
+  hf: Heightfield,
+  clearance: (q: Vec2) => number,
+  m: CMesh,
+  solid: Solid,
+) {
+  const W = MOUND_CREST + MOUND_RUN * PORTAL_TOP;
+  const J = 2 * Math.ceil(W / 1.5);
+  const lats = Array.from({length: J + 1}, (_, j) => -W + (2 * W * j) / J);
+  const rows: {y: number[]; pos: Vec3[]; a: number}[] = [];
+  // The first row's crest (clamped, not sunk) and ground, for the wing walls.
+  const crest0: number[] = [];
+  const ground0: number[] = [];
+  const end = Math.min(80, length - 6);
+  for (let a = 0.45; ; a += 2) {
+    const last = a > end;
+    const {p: c, h, d} = lineAt(e, arc, f.s + p.s * a);
+    const into: Vec2 = [d[0] * p.s, d[1] * p.s];
+    const l: Vec2 = [-into[1], into[0]];
+    const g = hf.sample(c[0], c[1]);
+    let top = a <= 6 ? PORTAL_TOP : PORTAL_TOP - (a - 6) * 0.5;
+    // The covered way: keep the line under the mound.
+    if (g < h + 1) top = Math.max(top, 2.2);
+    const y: number[] = [];
+    const pos: Vec3[] = [];
+    let any = false;
+    for (const lat of lats) {
+      const q: Vec2 = [c[0] + l[0] * lat, c[1] + l[1] * lat];
+      const gq = hf.sample(q[0], q[1]);
+      let crest =
+        h + top - Math.max(0, Math.abs(lat) - MOUND_CREST) / MOUND_RUN;
+      if (last) crest = -Infinity;
+      if (crest > gq + 0.05)
+        crest = Math.min(crest, gq + Math.max(0, clearance(q) - 1));
+      const up = crest > gq + 0.05;
+      any ||= up;
+      y.push(up ? crest : -Infinity);
+      if (!rows.length) {
+        crest0.push(crest);
+        ground0.push(gq);
+      }
+      pos.push([q[0], up ? crest : gq - 0.6, q[1]]);
+    }
+    rows.push({y, pos, a});
+    if (last || (!any && a > 6)) break;
+  }
+  const grass = packMat(CM.grass);
+  const ids: number[][] = rows.map((r, k) =>
+    r.pos.map((q, j) => {
+      // Normal from the neighbouring grid points.
+      const px = r.pos[Math.min(J, j + 1)];
+      const mx = r.pos[Math.max(0, j - 1)];
+      const pz = rows[Math.min(rows.length - 1, k + 1)].pos[j];
+      const mz = rows[Math.max(0, k - 1)].pos[j];
+      const u: Vec3 = [px[0] - mx[0], px[1] - mx[1], px[2] - mx[2]];
+      const v: Vec3 = [pz[0] - mz[0], pz[1] - mz[1], pz[2] - mz[2]];
+      let nrm: Vec3 = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+      ];
+      if (nrm[1] < 0) nrm = [-nrm[0], -nrm[1], -nrm[2]];
+      const nl = Math.hypot(nrm[0], nrm[1], nrm[2]) || 1;
+      return m.vertex(
+        q,
+        [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl],
+        lats[j],
+        r.a,
+        grass,
+      );
+    }),
+  );
+  for (let k = 0; k + 1 < rows.length; k++)
+    for (let j = 0; j < J; j++) {
+      const up = [
+        rows[k].y[j],
+        rows[k].y[j + 1],
+        rows[k + 1].y[j],
+        rows[k + 1].y[j + 1],
+      ].some(v => v > -Infinity);
+      if (!up) continue;
+      const a = ids[k][j];
+      const b = ids[k][j + 1];
+      const c = ids[k + 1][j + 1];
+      const dd = ids[k + 1][j];
+      m.triFacing(a, b, c, [0, 1, 0]);
+      m.triFacing(a, c, dd, [0, 1, 0]);
+    }
+  // Wing walls: the mound's face beside the headwall, its top following
+  // the mound's first row down to where that meets the ground.
+  const conc = packMat(CM.concrete);
+  const at = (lat: number, al: number, y: number): Vec3 => [
+    f.c[0] + f.l[0] * lat + f.into[0] * al,
+    y,
+    f.c[1] + f.l[1] * lat + f.into[1] * al,
+  ];
+  const back: Vec3 = [-f.into[0], 0, -f.into[1]];
+  for (const side of [-1, 1]) {
+    const run: [number, number, number][] = [];
+    for (let j = J / 2; j >= 0 && j <= J; j += side) {
+      const lat = lats[j];
+      if (Math.abs(lat) < p.half) continue;
+      const over = crest0[j] - ground0[j];
+      if (over <= 0.05) {
+        // Where the crest meets the ground, between this sample and the last.
+        const k = j - side;
+        const o0 = crest0[k] - ground0[k];
+        if (run.length && o0 > 0.05) {
+          const f0 = o0 / (o0 - over);
+          run.push([
+            lerp(lats[k], lat, f0),
+            lerp(crest0[k], crest0[j], f0),
+            lerp(ground0[k], ground0[j], f0),
+          ]);
+        }
+        break;
+      }
+      if (!run.length) {
+        // From the headwall's end (the first sample past it).
+        const k = j - side;
+        const f0 = (side * p.half - lats[k]) / (lat - lats[k]);
+        run.push([
+          side * p.half,
+          lerp(crest0[k], crest0[j], f0),
+          lerp(ground0[k], ground0[j], f0),
+        ]);
+      }
+      run.push([lat, crest0[j], ground0[j]]);
+    }
+    for (let k = 0; k + 1 < run.length; k++) {
+      const [la, ta, ga] = run[k];
+      const [lb, tb, gb] = run[k + 1];
+      m.quad(
+        [
+          at(la, -0.45, ga - 0.6),
+          at(lb, -0.45, gb - 0.6),
+          at(lb, -0.45, tb),
+          at(la, -0.45, ta),
+        ],
+        back,
+        [
+          [la, ga - 0.6],
+          [lb, gb - 0.6],
+          [lb, tb],
+          [la, ta],
+        ],
+        conc,
+      );
+      m.quad(
+        [
+          at(la, -0.45, ta),
+          at(lb, -0.45, tb),
+          at(lb, 0.45, tb),
+          at(la, 0.45, ta),
+        ],
+        [0, 1, 0],
+        [
+          [la, -0.45],
+          [lb, -0.45],
+          [lb, 0.45],
+          [la, 0.45],
+        ],
+        conc,
+      );
+    }
+  }
+  // The camera keeps out of the mound's core.
+  for (let k = 0; k < rows.length; k += 2) {
+    const r = rows[k];
+    const mid = r.pos[J / 2];
+    const crest = r.y[J / 2];
+    if (crest === -Infinity) continue;
+    const g = hf.sample(mid[0], mid[2]);
+    const {d} = lineAt(e, arc, f.s + p.s * r.a);
+    solid(
+      [mid[0], (crest + g - 1) / 2, mid[2]],
+      [MOUND_CREST, (crest - g + 1) / 2, 2],
+      Math.atan2(d[0], d[1]),
+    );
+  }
+}
 /** Records a camera-solid box (centre, half extents, yaw). */
 type Solid = (c: Vec3, h: Vec3, yaw: number) => void;
 
@@ -6308,6 +6786,11 @@ export interface BaseGeometry {
   /** Solid boxes of bridges and viaducts (piers, portal frames, station
    * stairs) for camera collision: cx, cy, cz, hx, hy, hz, yaw per box. */
   solids: number[];
+  /**
+   * Each elevated line's tunnels as arc-length intervals (s0, s1, ...)
+   * from bore to bore (railTunnels; none for expressways).
+   */
+  tunnels: number[][];
 }
 
 /**
@@ -6340,6 +6823,11 @@ export interface BasePart {
   streetLights?: Float64Array;
   /** blocks: the curb band triangles (bandTrisData). */
   band?: Float64Array;
+  /**
+   * elevated: each line's tunnels (railTunnels), one after another: their
+   * count of arc lengths, then the arc lengths.
+   */
+  tunnels?: Float64Array;
 }
 
 export function basePartTransfer(p: BasePart): Transferable[] {
@@ -6357,6 +6845,7 @@ export function basePartTransfer(p: BasePart): Transferable[] {
     p.mask,
     p.streetLights,
     p.band,
+    p.tunnels,
   ])
     if (a) out.push(a.buffer);
   return out;
@@ -6424,9 +6913,10 @@ export function buildBasePart(
     blocks(L, m, geom);
     part.band = bandTrisData(geom);
   } else {
-    elevatedStructures(L, geom, mask, m, lights, (c, h, yaw) =>
+    const tunnels = elevatedStructures(L, geom, mask, m, lights, (c, h, yaw) =>
       solids.push(c[0], c[1], c[2], h[0], h[1], h[2], yaw),
     );
+    part.tunnels = new Float64Array(tunnels.flatMap(t => [t.length, ...t]));
     const street = new LightList();
     streetLights(L, geom, street);
     part.streetLights = new Float64Array(street.data);
@@ -6489,7 +6979,15 @@ export function assembleBase(
     geom,
     terrainHeights: r.settled!,
     solids,
+    tunnels: unpackTunnels(of('elevated').tunnels),
   };
+}
+
+function unpackTunnels(a: Float64Array | undefined): number[][] {
+  const out: number[][] = [];
+  for (let k = 0; a && k < a.length; k += a[k] + 1)
+    out.push(Array.from(a.subarray(k + 1, k + 1 + a[k])));
+  return out;
 }
 
 export function buildBase(L: CityLayout): BaseGeometry {

@@ -157,6 +157,12 @@ export interface Elevated {
   loop: boolean;
   /** Station positions as indices into pts. */
   stations: number[];
+  /**
+   * Rail: arc-length intervals (s0, s1, ...) of its tunnels, from bore to
+   * bore; trains are not drawn inside. Set from the base build (gen-base
+   * railTunnels) in the layout summary, not by generateLayout.
+   */
+  tunnels?: number[];
 }
 
 export interface CityLayout {

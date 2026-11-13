@@ -7,7 +7,15 @@ struct Instance {
   color: vec4f,
   color2: vec4f,
   params: vec4f,  // x = headlights, y = brake, z = indicator (-1 left, 1 right), w = dirt
+  // World points p with dot(p, clip.xyz) > clip.w are cut away (a train
+  // going into a tunnel); (0, 0, 0, 1) keeps everything.
+  clip: vec4f,
 };
+
+fn clipped(inst: u32, w: vec3f) -> bool {
+  let c = instances[inst].clip;
+  return dot(w, c.xyz) > c.w;
+}
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
@@ -198,7 +206,7 @@ fn outwardFacing(inst: u32, ff: bool) -> bool {
 @fragment fn fs(i: VOut, @builtin(front_facing) ff: bool) -> GOut {
   // Pixel footprint for filtered interior detail (derivatives in uniform flow).
   let fw = length(fwidth(i.local));
-  if (i.mat == 2u) { discard; }
+  if (i.mat == 2u || clipped(i.inst, i.world)) { discard; }
   var n = normalize(i.normal);
   if (!outwardFacing(i.inst, ff)) { n = -n; }
   let s = vehicleSurf(i, n, fw);
@@ -213,7 +221,7 @@ fn outwardFacing(inst: u32, ff: bool) -> bool {
 
 // Glass: forward, alpha blended over the lit image.
 @fragment fn fsGlass(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
-  if (i.mat != 2u) { discard; }
+  if (i.mat != 2u || clipped(i.inst, i.world)) { discard; }
   var n = normalize(i.normal);
   if (!outwardFacing(i.inst, ff)) { n = -n; }
   let v = normalize(frame.camPos.xyz - i.world);
@@ -238,5 +246,10 @@ struct ShadowView { viewProj: mat4x4f };
 @group(0) @binding(1) var<uniform> shadowView: ShadowView;
 
 @vertex fn vsShadow(@location(0) p: vec3f, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
-  return shadowView.viewProj * (instances[ii].model * vec4f(p, 1.0));
+  let I = instances[ii];
+  var w = (I.model * vec4f(p, 1.0)).xyz;
+  // (No fragment stage: what is cut away is flattened onto the plane.)
+  let over = dot(w, I.clip.xyz) - I.clip.w;
+  if (over > 0.0) { w -= I.clip.xyz * over; }
+  return shadowView.viewProj * vec4f(w, 1.0);
 }

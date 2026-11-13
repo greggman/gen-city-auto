@@ -241,30 +241,40 @@ void test('rail viaducts follow the ground and end at termini', () => {
 
 // Hong Kong and Chongqing rail lines came out of the hill (or a road cut
 // into it) on the roads themselves: the portal's walls and dark opening
-// stood across the lanes. No headwall stands on a carriageway now (a few
-// mouths with nowhere to move to get none).
+// stood across the lanes. No headwall stands on a carriageway now, and all
+// but a mouth or two get one (a narrower headwall where the full one
+// doesn't fit).
 void test('rail tunnel portals stand off the roads', () => {
+  let missing = 0;
   for (const [type, seed] of [
     ['harbour', 1],
     ['harbour', 2],
     ['river', 1],
+    ['river', 2],
   ] as const) {
     const L = layoutOf(type, seed);
     const inRoad = carriageway(L, computeRoadGeom(L));
     for (const e of L.elevated) {
       if (e.kind !== 'rail') continue;
-      const {under, noPortal} = tunnelPlan(e, L.terrain.heights, inRoad);
-      assert.ok(noPortal.size <= 4, `${type} ${seed}: ${noPortal.size}`);
-      for (let b = 1; b < e.pts.length; b++) {
-        if (under[b] === under[b - 1] || noPortal.has(b)) continue;
-        const a = e.pts[b - 1];
-        const c = e.pts[b];
+      const {under, noPortal, portals} = tunnelPlan(
+        e,
+        L.terrain.heights,
+        inRoad,
+      );
+      missing += noPortal.size;
+      let mouths = 0;
+      for (let b = 1; b < e.pts.length; b++)
+        if (under[b] !== under[b - 1]) mouths++;
+      assert.equal(portals.length + noPortal.size, mouths);
+      for (const p of portals) {
+        const a = e.pts[p.i];
+        const c = e.pts[p.i + 1];
         const l = Math.hypot(c[0] - a[0], c[1] - a[1]);
         const lat = [(a[1] - c[1]) / l, (c[0] - a[0]) / l];
-        for (let s = -7; s <= 7; s += 0.5) {
+        for (let s = -p.half; s <= p.half; s += 0.5) {
           const q: Vec2 = [
-            (a[0] + c[0]) / 2 + lat[0] * s,
-            (a[1] + c[1]) / 2 + lat[1] * s,
+            a[0] + (c[0] - a[0]) * p.t + lat[0] * s,
+            a[1] + (c[1] - a[1]) * p.t + lat[1] * s,
           ];
           assert.ok(
             !inRoad(q, 0),
@@ -274,6 +284,7 @@ void test('rail tunnel portals stand off the roads', () => {
       }
     }
   }
+  assert.ok(missing <= 2, `${missing} mouths without a portal`);
 });
 
 // The street tracer once ran lines back alongside themselves (contours
