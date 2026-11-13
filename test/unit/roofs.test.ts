@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {building, solidTop, useCityRoofs} from '../../src/city/gen-tile.ts';
 import {CM, CMesh, VERTEX_WORDS} from '../../src/city/cmesh.ts';
+import {straightSkeleton} from '../../src/city/skeleton.ts';
 import {LightList} from '../../src/city/gen-base.ts';
 import type {Building} from '../../src/city/layout.ts';
 import {
@@ -56,6 +57,44 @@ const PLANS: Record<string, Vec2[]> = {
     [6, 6],
     [6, 14],
     [0, 14],
+  ],
+  tee: [
+    [0, 0],
+    [16, 0],
+    [16, 6],
+    [11, 6],
+    [11, 14],
+    [5, 14],
+    [5, 6],
+    [0, 6],
+  ],
+  you: [
+    [0, 0],
+    [16, 0],
+    [16, 12],
+    [11, 12],
+    [11, 5],
+    [5, 5],
+    [5, 12],
+    [0, 12],
+  ],
+  zed: [
+    [0, 0],
+    [10, 0],
+    [10, 5],
+    [16, 5],
+    [16, 11],
+    [6, 11],
+    [6, 6],
+    [0, 6],
+  ],
+  skewEll: [
+    [0, 0],
+    [13, 1],
+    [12.5, 7],
+    [7, 6.5],
+    [6, 15],
+    [-1, 14],
   ],
   notch: [
     [0, 0],
@@ -186,9 +225,45 @@ void test('flat house roofs keep inside their walls', () => {
       }
 });
 
+/** Concave plans' half wing width: a hipped roof's ridge rises this far. */
+const RIDGE: Record<string, number> = {ell: 3, tee: 3, you: 2.5, zed: 3};
+
+void test('concave house plans get a hipped and valleyed roof', () => {
+  useCityRoofs('metro');
+  for (const name of ['ell', 'tee', 'you', 'zed', 'skewEll', 'notch']) {
+    const fp = PLANS[name];
+    // The skeleton tiles the plan, a face per wall rising from it.
+    const faces = straightSkeleton(fp);
+    assert.ok(faces, `${name}: no skeleton`);
+    assert.equal(faces.length, fp.length);
+    const area = faces.reduce((s, f) => s + polygonArea(f.poly), 0);
+    assert.ok(Math.abs(area - polygonArea(fp)) < 1e-3 * polygonArea(fp));
+    for (const lod of [0, 1]) {
+      const b = house(fp, 0);
+      const m = new CMesh(256, 512);
+      building(b, m, lod, new LightList(), 0);
+      const eaves = solidTop(b);
+      let top = -Infinity;
+      for (let i = 0; i < m.vcount; i++) {
+        const o = i * VERTEX_WORDS;
+        const mat = m.u32[o + 6] & 0xff;
+        const y = m.f32[o + 1];
+        if (mat === CM.tile) top = Math.max(top, y);
+        // No gable walls: nothing but roof tiles above the eaves.
+        else assert.ok(y < eaves + 0.01, `${name} lod ${lod}: wall over eaves`);
+      }
+      if (RIDGE[name])
+        assert.ok(
+          Math.abs(top - (eaves + 0.55 * RIDGE[name])) < 0.02,
+          `${name} lod ${lod}: ridge at ${top - eaves} over the eaves`,
+        );
+    }
+  }
+});
+
 void test('eaves have a fascia and a soffit at LOD0', () => {
   useCityRoofs('metro');
-  for (const name of ['rect', 'pentagon', 'ell', 'notch']) {
+  for (const name of ['rect', 'pentagon', 'ell', 'tee']) {
     const fp = PLANS[name];
     const count = (lod: number) => {
       const b = house(fp, 0);

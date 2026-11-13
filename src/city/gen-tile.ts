@@ -12,6 +12,7 @@ import {
   type Vec3,
 } from '../math/vec.ts';
 import {CM, CMesh, packMat, triangulate} from './cmesh.ts';
+import {straightSkeleton} from './skeleton.ts';
 import {keepLeft, nearside, type CityType} from './config.ts';
 import {
   CITI_BLUE,
@@ -3090,6 +3091,86 @@ function eaveTrim(
 }
 
 /**
+ * A hipped roof over concave CCW footprint `fp` (L, T, U, Z ...) from its
+ * straight skeleton: a plane up from every wall at `slope`, hips and valleys
+ * where they meet, out over the overhang; topped flat `maxRise` over the
+ * eaves. False (nothing built) if the skeleton fails.
+ */
+function skeletonRoof(
+  m: CMesh,
+  fp: Vec2[],
+  eaves: number,
+  slope: number,
+  maxRise: number,
+  roofMat: number,
+  aux: number,
+  trim: EaveTrim,
+) {
+  const faces = straightSkeleton(fp);
+  if (!faces) return false;
+  const n = fp.length;
+  const plan = eavePlan(fp, EAVE, EAVE_MAX) ?? fp;
+  const planes: RoofPlane[] = fp.map((a, i) => {
+    const e = edgeNormal(fp, i);
+    // eaves + slope * (distance in from wall i).
+    return [
+      -slope * e[0],
+      -slope * e[2],
+      eaves + slope * (a[0] * e[0] + a[1] * e[2]),
+    ];
+  });
+  const top = eaves + maxRise;
+  const flat: RoofPlane = [0, 0, top];
+  const emit = (f: Vec2[], P: RoofPlane) => {
+    const g = Math.hypot(P[0], P[1]);
+    const gd: Vec2 = g > 1e-6 ? [P[0] / g, P[1] / g] : [0, 1];
+    const nl = Math.hypot(P[0], 1, P[1]);
+    const nv: Vec3 = [-P[0] / nl, 1 / nl, -P[1] / nl];
+    const ids = f.map(q =>
+      m.vertex(
+        [q[0], planeAt(P, q), q[1]],
+        nv,
+        q[0] * -gd[1] + q[1] * gd[0],
+        q[0] * gd[0] + q[1] * gd[1],
+        roofMat,
+        aux,
+      ),
+    );
+    if (f.length === 3) m.triFacing(ids[0], ids[1], ids[2], nv);
+    else {
+      const idx = triangulate(f);
+      for (let k = 0; k < idx.length; k += 3)
+        m.triFacing(ids[idx[k]], ids[idx[k + 1]], ids[idx[k + 2]], nv);
+    }
+  };
+  for (const face of faces) {
+    const P = planes[face.edge];
+    // Out over the overhang: the eave corners lie on the hips' lines.
+    const f = [
+      plan[face.edge],
+      plan[(face.edge + 1) % n],
+      ...face.poly.slice(2),
+    ];
+    if (Math.max(...f.map(q => planeAt(P, q))) <= top + 1e-6) {
+      emit(f, P);
+      continue;
+    }
+    // Past maxRise: the part above is flat.
+    const idx = triangulate(f);
+    for (let k = 0; k < idx.length; k += 3) {
+      const t = [f[idx[k]], f[idx[k + 1]], f[idx[k + 2]]];
+      const lo = clipHalf(t, P[0], P[1], P[2] - top);
+      const hi = clipHalf(t, -P[0], -P[1], top - P[2]);
+      if (lo.length >= 3 && Math.abs(polygonArea(lo)) > 1e-3) emit(lo, P);
+      if (hi.length >= 3 && Math.abs(polygonArea(hi)) > 1e-3) emit(hi, flat);
+    }
+  }
+  // Over wall i's overhang the roof is plane i.
+  eaveTrim(m, fp, plan, i => [planes[i]], trim, aux);
+  return true;
+}
+
+/**
  * A pitched roof over CCW footprint `fp` with its eaves at `eaves`: the
  * lower envelope of `planes` (each at least `eaves` over the footprint), out
  * to a 0.45 m overhang where it drops on down, and gable walls filling up
@@ -3221,9 +3302,13 @@ function houseRoof(
 ) {
   const slope = 0.55;
   const maxRise = 4;
+  const convex = isConvex(fp);
+  // A concave plan is hipped and valleyed over its straight skeleton (or,
+  // should that fail, gabled as an awkward plan below).
+  if (!convex && skeletonRoof(m, fp, eaves, slope, maxRise, roofMat, aux, trim))
+    return;
   const box = obb(fp);
   const rect = polygonArea(fp) / (4 * box.hu * box.hv);
-  const convex = isConvex(fp);
   // Some near-rectangular houses are hipped too (from the style word, not
   // the building stream).
   const hipRect = ((b.style >>> 5) & 3) === 0;

@@ -4,7 +4,9 @@
 // 1 m under its eaves (solidTop), so the overhang's drop is in. Counts the roof vertices and roof area (sampled on a 0.25 m
 // grid) more than EAVE m outside the footprint, the houses with any, the
 // worst overhang, roof corners inside the walls but below the eaves (the
-// roof dipping under the ceiling), and the houses' triangle count.
+// roof dipping under the ceiling), the pitched houses' plan left uncovered
+// by roof tiles at or over the eaves (sampled on a 0.5 m grid), and the
+// houses' triangle count.
 import {PRESETS, type CityType} from '../src/city/config.ts';
 import {building, solidTop, useCityRoofs} from '../src/city/gen-tile.ts';
 import {CM, CMesh, VERTEX_WORDS} from '../src/city/cmesh.ts';
@@ -47,6 +49,9 @@ for (const city of cities)
       tris = 0,
       roofTris = 0,
       sag = 0,
+      bare = 0,
+      bareHouses = 0,
+      bareId = -1,
       worst = {id: -1, d: 0};
     for (const b of L.buildings) {
       if (b.kind !== 'house') continue;
@@ -118,11 +123,55 @@ for (const city of cities)
         if (n) badArea += (ta * o) / n;
       }
       if (hBad) bad++;
+      if (pitched) {
+        // Roof tiles over the plan, never under the eaves.
+        const tiles: number[][][] = [];
+        for (let t = 0; t < m.icount; t += 3) {
+          const ids = [m.idx[t], m.idx[t + 1], m.idx[t + 2]];
+          if (ids.some(i => (m.u32[i * VERTEX_WORDS + 6] & 0xff) !== CM.tile))
+            continue;
+          tiles.push(ids.map(P));
+        }
+        const fp = b.footprint;
+        let x0 = Infinity,
+          x1 = -Infinity,
+          z0 = Infinity,
+          z1 = -Infinity;
+        for (const q of fp) {
+          x0 = Math.min(x0, q[0]);
+          x1 = Math.max(x1, q[0]);
+          z0 = Math.min(z0, q[1]);
+          z1 = Math.max(z1, q[1]);
+        }
+        const before = bare;
+        for (let x = x0 + 0.25; x < x1; x += 0.5)
+          for (let z = z0 + 0.25; z < z1; z += 0.5) {
+            if (!pointInPolygon([x, z], fp)) continue;
+            let y = -Infinity;
+            for (const [a, c, d] of tiles) {
+              const det =
+                (c[0] - a[0]) * (d[2] - a[2]) - (d[0] - a[0]) * (c[2] - a[2]);
+              if (Math.abs(det) < 1e-9) continue;
+              const s =
+                ((x - a[0]) * (d[2] - a[2]) - (d[0] - a[0]) * (z - a[2])) / det;
+              const r =
+                ((c[0] - a[0]) * (z - a[2]) - (x - a[0]) * (c[2] - a[2])) / det;
+              if (s < -1e-6 || r < -1e-6 || s + r > 1 + 1e-6) continue;
+              y = Math.max(y, a[1] + (c[1] - a[1]) * s + (d[1] - a[1]) * r);
+            }
+            if (y < y0 + 1 - 1e-3) bare += 0.25;
+          }
+        if (bare > before) {
+          bareHouses++;
+          bareId = b.id;
+        }
+      }
     }
     console.log(
       `${city} seed ${seed}: ${houses} houses (${flat} flat-roofed), ${bad} with roof past walls+${EAVE} m; ` +
         `roof verts ${badVerts}/${verts} out; roof area ${Math.round(badArea)}/${Math.round(area)} m^2 out; ` +
         `worst ${worst.d.toFixed(1)} m (id ${worst.id}); roof corners under the eaves ${sag}; ` +
+        `plan uncovered ${bare} m^2 (${bareHouses} houses, id ${bareId}); ` +
         `house tris ${tris} (roof ${roofTris})`,
     );
   }
